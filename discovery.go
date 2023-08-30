@@ -2,17 +2,27 @@ package etcd
 
 import (
 	"context"
+	"log"
 	"sync"
 	"time"
 
 	"go.etcd.io/etcd/api/v3/mvccpb"
 	clientv3 "go.etcd.io/etcd/client/v3"
+
+	"github.com/zhang2092/etcd/balance"
+)
+
+const (
+	RoundRobin int = iota
+	Random
+	Weight
+	Hash
 )
 
 type RemoteService struct {
-	name  string
-	node  map[string]string
-	mutex sync.Mutex
+	name    string
+	balance balance.Balancer
+	mutex   sync.Mutex
 }
 
 type Resolver struct {
@@ -39,10 +49,9 @@ func (r *Resolver) Close() error {
 }
 
 // Discovery 发现服务
-func (r *Resolver) Discovery(serviceName string) (*RemoteService, error) {
+func (r *Resolver) Discovery(serviceName string, balanceType int) (*RemoteService, error) {
 	service := &RemoteService{
 		name: serviceName,
-		node: make(map[string]string, 1),
 	}
 
 	kv := clientv3.NewKV(r.v3)
@@ -55,11 +64,7 @@ func (r *Resolver) Discovery(serviceName string) (*RemoteService, error) {
 		return nil, err
 	}
 
-	service.mutex.Lock()
-	for _, kv := range resp.Kvs {
-		service.node[string(kv.Key)] = string(kv.Value)
-	}
-	service.mutex.Unlock()
+	processorBalance(service, resp.Kvs, balanceType)
 
 	go r.watchServiceUpdate(service)
 
@@ -76,13 +81,50 @@ func (r *Resolver) watchServiceUpdate(service *RemoteService) {
 			service.mutex.Lock()
 			switch event.Type {
 			case mvccpb.PUT: // PUT事件，目录下有了新key
-				service.node[string(event.Kv.Key)] = string(event.Kv.Value)
+				_ = service.balance.Add(balance.Addr{
+					Key:   string(event.Kv.Key),
+					Value: string(event.Kv.Value),
+				})
 			case mvccpb.DELETE: // DELETE事件，目录中有key被删掉(Lease过期，key 也会被删掉)
-				delete(service.node, string(event.Kv.Key))
+				service.balance.Delete(string(event.Kv.Key))
 			}
 			service.mutex.Unlock()
 		}
 	}
+}
+
+func processorBalance(service *RemoteService, kvs []*mvccpb.KeyValue, balanceType int) {
+	switch balanceType {
+	case RoundRobin:
+		_ = genRoundRobin(service, kvs)
+	case Random:
+		_ = genRandom(service, kvs)
+	case Weight:
+		log.Println("weight develop ...")
+	case Hash:
+		log.Println("hash develop ...")
+	}
+}
+
+func genAddr(kvs []*mvccpb.KeyValue) []balance.Addr {
+	var address []balance.Addr
+	for _, kv := range kvs {
+		address = append(address, balance.Addr{
+			Key:   string(kv.Key),
+			Value: string(kv.Value),
+		})
+	}
+	return address
+}
+
+func genRoundRobin(service *RemoteService, kvs []*mvccpb.KeyValue) error {
+	service.balance = balance.NewRoundRobin()
+	return service.balance.Add(genAddr(kvs)...)
+}
+
+func genRandom(service *RemoteService, kvs []*mvccpb.KeyValue) error {
+	service.balance = balance.NewRandom()
+	return service.balance.Add(genAddr(kvs)...)
 }
 
 // GetName 获取服务名称
@@ -90,7 +132,7 @@ func (r *RemoteService) GetName() string {
 	return r.name
 }
 
-// GetNode 获取服务列表
-func (r *RemoteService) GetNode() map[string]string {
-	return r.node
+// Next 根据算法获取下个值
+func (r *RemoteService) Next() string {
+	return r.balance.Next()
 }
